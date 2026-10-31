@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Procedural Voxel Planet — CPU Raymarcher</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;
+            font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  #c{display:block;width:100vw;height:100vh;image-rendering:pixelated;cursor:crosshair}
+  #hud{position:fixed;left:12px;top:12px;color:#cfe;text-shadow:0 1px 4px #000;
+       pointer-events:none;white-space:pre;letter-spacing:.4px}
+  #hint{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+        color:#fff;background:rgba(0,0,0,.65);padding:18px 30px;border-radius:12px;
+        text-align:center;pointer-events:none;font-size:13px;letter-spacing:.4px;
+        border:1px solid rgba(255,255,255,.12)}
+  #hint b{font-size:16px;display:block;margin-bottom:8px;letter-spacing:.8px}
+  #hint kbd{background:#222;border:1px solid #444;border-radius:4px;padding:1px 5px;
+            font-family:inherit;font-size:11px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="hint">
+  <b>PROCEDURAL VOXEL PLANET</b>
+  <kbd>click</kbd> to fly &nbsp;·&nbsp; <kbd>WASD</kbd> thrust<br>
+  <kbd>mouse</kbd> look &nbsp;·&nbsp; <kbd>Space</kbd>/<kbd>Ctrl</kbd> up/down<br>
+  <kbd>Shift</kbd> warp drive &nbsp;·&nbsp; <kbd>R</kbd> reset to orbit
+</div>
+<script>
+(() => {
+"use strict";
+
+/* ============================================================
+   1. CANVAS + ADAPTIVE RESOLUTION
+   ============================================================ */
+const cv   = document.getElementById('c');
+const ctx  = cv.getContext('2d', { alpha:false });
+const off  = document.createElement('canvas');
+const octx = off.getContext('2d', { alpha:false });
+
+let RW = 256, RH = 144;
+let img = null, buf32 = null;
+let quality = 0.80;
+
+function setResolution(w) {
+  RW = Math.max(140, Math.round(w));
+  RH = Math.max(80,  Math.round(RW * cv.height / cv.width));
+  off.width = RW; off.height = RH;
+  img   = octx.createImageData(RW, RH);
+  buf32 = new Uint32Array(img.data.buffer);
+  ctx.imageSmoothingEnabled = false;
+}
+function resizeWindow() {
+  cv.width  = Math.max(320, window.innerWidth  | 0);
+  cv.height = Math.max(200, window.innerHeight | 0);
+  ctx.imageSmoothingEnabled = false;
+  setResolution(quality * 320);
+}
+window.addEventListener('resize', resizeWindow);
+
+/* ============================================================
+   2. 3D VALUE NOISE  —  the seed of everything
+   ============================================================ */
+const SEED = 0x9e3779b9;
+
+function h3(x, y, z) {
+  let n = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^
+          Math.imul(z, 1274126177) ^ SEED;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n ^= n >>> 16;
+  return (n >>> 0) * 2.3283064365386963e-10;   // 0..1
+}
+
+function noise3(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = x - xi, yf = y - yi, zf = z - zi;
+  const u = xf*xf*(3-2*xf), v = yf*yf*(3-2*yf), w = zf*zf*(3-2*zf);
+  const c000 = h3(xi,   yi,   zi  ), c100 = h3(xi+1, yi,   zi  );
+  const c010 = h3(xi,   yi+1, zi  ), c110 = h3(xi+1, yi+1, zi  );
+  const c001 = h3(xi,   yi,   zi+1), c101 = h3(xi+1, yi,   zi+1);
+  const c011 = h3(xi,   yi+1, zi+1), c111 = h3(xi+1, yi+1, zi+1);
+  const a0 = c000 + (c100 - c000) * u;
+  const a1 = c010 + (c110 - c010) * u;
+  const b0 = c001 + (c101 - c001) * u;
+  const b1 = c011 + (c111 - c011) * u;
+  const p0 = a0 + (a1 - a0) * v;
+  const p1 = b0 + (b1 - b0) * v;
+  return p0 + (p1 - p0) * w;
+}
+
+/* ============================================================
+   3. THE PLANET
+   ============================================================
+   Sample 3D noise on the surface of a sphere -> the terrain
+   wraps perfectly: no seams, no poles, no edges.  One function
+   describes the entire world at any zoom level.
+   ============================================================ */
+const R       = 800;      // planetary radius (sea level)
+const MAX_ALT = 170;      // max terrain height above sea level
+const ATM_H   = 280;      // atmosphere thickness
+const R_OUT   = R + ATM_H;
+const R_IN    = R - MAX_ALT - 4;
+
+const S1 = 2.10, O1X =  13.1, O1Y =  -7.3, O1Z =  21.7;
+const S2 = 6.70, O2X =  -3.3, O2Y =  11.1, O2Z = -17.9;
+
+function terrainAlt(dx, dy, dz) {
+  const n1 = noise3(dx*S1 + O1X, dy*S1 + O1Y, dz*S1 + O1Z);
+  const n2 = noise3(dx*S2 + O2X, dy*S2 + O2Y, dz*S2 + O2Z);
+  return (n1*0.78 + n2*0.22 - 0.47) * 300;   // ~ -141 .. +159
+}
+
+/* ============================================================
+   4. CAMERA + INPUT
+   ============================================================ */
+let camX = 0, camY = 120, camZ = 2150;
+let vX = 0, vY = 0, vZ = 0;
+let yaw = 0, pitch = -0.06;
+const FOV = 1.30;
+
+const keys = Object.create(null);
+let locked = false;
+const hintEl = document.getElementById('hint');
+
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (e.code === 'KeyR') resetToOrbit();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+cv.addEventListener('click', () => {
+  if (cv.requestPointerLock) cv.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  locked = (document.pointerLockElement === cv);
+  hintEl.style.display = locked ? 'none' : 'block';
+});
+document.addEventListener('mousemove', e => {
+  if (!locked) return;
+  yaw   += e.movementX * 0.0022;
+  pitch -= e.movementY * 0.0022;
+  if (pitch >  1.5) pitch =  1.5;
+  if (pitch < -1.5) pitch = -1.5;
+});
+
+function resetToOrbit() {
+  camX = 0; camY = 120; camZ = 2150;
+  vX = vY = vZ = 0;
+  yaw = 0; pitch = -0.06;
+}
+
+/* ============================================================
+   5. SPHERE TRACER  —  the SDF raymarcher
+   ============================================================
+   The signed distance to the terrain surface is
+       d(p) = |p| - R - max(alt(dir), 0)
+   whose gradient is bounded, so we can safely step by d/L
+   and never overshoot the surface.  Near the surface the
+   steps shrink automatically; far away they grow.
+   ============================================================ */
+const EPS    = 0.4;
+const INV_L  = 1 / 2.6;
+const MAX_STEPS = 120;
+
+const hit = { ok:false, t:0, x:0, y:0, z:0, alt:0, water:false };
+
+function trace(ox, oy, oz, dx, dy, dz) {
+  hit.ok = false;
+
+  /* --- outer atmosphere sphere --- */
+  const b = ox*dx + oy*dy + oz*dz;
+  const c = ox*ox + oy*oy + oz*oz - R_OUT*R_OUT;
+  const disc = b*b - c;
+  if (disc < 0) return;
+  const sq = Math.sqrt(disc);
+  let t0 = -b - sq;
+  let t1 = -b + sq;
+  if (t1 < 0) return;
+
+  /* --- solid core: past this point we're guaranteed inside --- */
+  const c2 = ox*ox + oy*oy + oz*oz - R_IN*R_IN;
+  const disc2 = b*b - c2;
+  if (disc2 >= 0) {
+    const ti = -b - Math.sqrt(disc2);
+    if (ti > t0 && ti < t1) t1 = ti;
+  }
+  if (t0 < 0) t0 = 0;
+  if (t0 > t1) return;
+
+  /* --- sphere-trace the noise heightfield --- */
+  let t = t0;
+  for (let i = 0; i < MAX_STEPS; i++) {
+    const px = ox + dx*t;
+    const py = oy + dy*t;
+    const pz = oz + dz*t;
+    const r  = Math.sqrt(px*px + py*py + pz*pz);
+    const inv = 1/r;
+    const alt = terrainAlt(px*inv, py*inv, pz*inv);
+    const surf = alt > 0 ? alt : 0;      // water fills up to sea level
+    const d = r - R - surf;
+
+    if (d < EPS) {
+      hit.ok = true; hit.t = t;
+      hit.x = px; hit.y = py; hit.z = pz;
+      hit.alt = alt; hit.water = alt < 0;
+      return;
+    }
+    t += d * INV_L;
+    if (t > t1) return;
+  }
+}
+
+/* ============================================================
+   6. SHADING
+   ============================================================ */
+const SUN_X = 0.42, SUN_Y = 0.74, SUN_Z = 0.52;
+const FOG_R = 95,  FOG_G = 155, FOG_B = 220;
+
+let camR    = 0;
+let fogDist = 900;
+let atmBlend = 0;
+
+function updateAtmos() {
+  camR = Math.sqrt(camX*camX + camY*camY + camZ*camZ);
+  const h = camR - R;
+  atmBlend = h < ATM_H ? 1 - h/ATM_H : 0;
+  fogDist = 900 + 14 * (h > 0 ? h : 0);
+  if (fogDist < 400) fogDist = 400;
+}
+
+function shadeHit(dx, dy, dz) {
+  const px = hit.x, py = hit.y, pz = hit.z;
+  const r  = Math.sqrt(px*px + py*py + pz*pz);
+  const nx0 = px/r, ny0 = py/r, nz0 = pz/r;
+
+  let nX, nY, nZ;
+
+  if (hit.water) {
+    /* calm flat ocean — radial normal */
+    nX = nx0; nY = ny0; nZ = nz0;
+  } else {
+    /* --- tangent basis on the sphere --- */
+    let tx, ty, tz;
+    if (ny0 > -0.9 && ny0 < 0.9) { tx = 0; ty = 1; tz = 0; }
+    else                          { tx = 1; ty = 0; tz = 0; }
+
+    let t1x = ny0*tz - nz0*ty;
+    let t1y = nz0*tx - nx0*tz;
+    let t1z = nx0*ty - ny0*tx;
+    const l1 = 1/Math.sqrt(t1x*t1x + t1y*t1y + t1z*t1z);
+    t1x*=l1; t1y*=l1; t1z*=l1;
+
+    const t2x = ny0*t1z - nz0*t1y;
+    const t2y = nz0*t1x - nx0*t1z;
+    const t2z = nx0*t1y - ny0*t1x;
+
+    /* --- finite-difference normal --- */
+    const e  = 0.012;
+    const a0 = hit.alt;
+
+    let bx = nx0 + e*t1x, by = ny0 + e*t1y, bz = nz0 + e*t1z;
+    let bl = 1/Math.sqrt(bx*bx + by*by + bz*bz);
+    const a1 = terrainAlt(bx*bl, by*bl, bz*bl);
+
+    let cx = nx0 + e*t2x, cy = ny0 + e*t2y, cz = nz0 + e*t2z;
+    let cl = 1/Math.sqrt(cx*cx + cy*cy + cz*cz);
+    const a2 = terrainAlt(cx*cl, cy*cl, cz*cl);
+
+    const g1 = (a1 - a0) / e;
+    const g2 = (a2 - a0) / e;
+
+    nX = nx0 - (g1*t1x + g2*t2x) / R;
+    nY = ny0 - (g1*t1y + g2*t2y) / R;
+    nZ = nz0 - (g1*t1z + g2*t2z) / R;
+    const nl = 1/Math.sqrt(nX*nX + nY*nY + nZ*nZ);
+    nX*=nl; nY*=nl; nZ*=nl;
+  }
+
+  /* --- material by altitude band --- */
+  const a = hit.alt;
+  let cr, cg, cb;
+  if (hit.water)      { cr =  28; cg =  76; cb = 148; }
+  else if (a <  10)   { cr = 208; cg = 194; cb = 152; }   // beach
+  else if (a <  55)   { cr =  64; cg = 112; cb =  54; }   // grass
+  else if (a < 100)   { cr = 108; cg = 102; cb =  94; }   // rock
+  else                { cr = 238; cg = 242; cb = 248; }   // snow
+
+  /* --- lighting --- */
+  let ndl = nX*SUN_X + nY*SUN_Y + nZ*SUN_Z;
+  if (ndl < 0) ndl = 0;
+  const lit = 0.16 + 0.92*ndl;
+
+  let rC = cr*lit, gC = cg*lit, bC = cb*lit;
+
+  /* --- water specular glint --- */
+  if (hit.water) {
+    const vdx = -dx, vdy = -dy, vdz = -dz;
+    const ndv = nX*vdx + nY*vdy + nZ*vdz;
+    const rx = 2*ndv*nX - vdx;
+    const ry = 2*ndv*nY - vdy;
+    const rz = 2*ndv*nZ - vdz;
+    let sd = rx*SUN_X + ry*SUN_Y + rz*SUN_Z;
+    if (sd < 0) sd = 0;
+    const s2 = sd*sd, s4 = s2*s2, s8 = s4*s4, s16 = s8*s8;
+    rC += s16*210; gC += s16*200; bC += s16*180;
+  }
+
+  /* --- aerial perspective / distance fog --- */
+  const fog = Math.min(0.92, hit.t / (hit.t + fogDist));
+  rC += (FOG_R - rC) * fog;
+  gC += (FOG_G - gC) * fog;
+  bC += (FOG_B - bC) * fog;
+
+  if (rC > 255) rC = 255; if (gC > 255) gC = 255; if (bC > 255) bC = 255;
+  if (rC < 0) rC = 0; if (gC < 0) gC = 0; if (bC < 0) bC = 0;
+
+  return (0xff000000 | (bC|0)<<16 | (gC|0)<<8 | (rC|0)) >>> 0;
+}
+
+function shadeSky(dx, dy, dz) {
+  /* --- stars: quantise the ray direction to a fine grid --- */
+  const q  = 380;
+  const sx = Math.round(dx*q), sy = Math.round(dy*q), sz = Math.round(dz*q);
+  const hs = h3(sx, sy, sz);
+  let star = 0;
+  if (hs > 0.9972) {
+    const k = (hs - 0.9972) * 357.14;
+    star = k*k*255;
+  }
+
+  /* --- deep-space gradient --- */
+  const up = dy > 0 ? dy : -dy;
+  let r = 3 + 7*(1-up);
+  let g = 5 + 12*(1-up);
+  let b = 14 + 24*(1-up);
+
+  /* --- sun disc + halo --- */
+  let sd = dx*SUN_X + dy*SUN_Y + dz*SUN_Z;
+  if (sd > 0) {
+    const s2 = sd*sd, s4 = s2*s2, s8 = s4*s4, s16 = s8*s8, s32 = s16*s16, s64 = s32*s32;
+    const halo = s64 * 0.85;
+    r += halo*255; g += halo*235; b += halo*190;
+    if (sd > 0.9994) {
+      const k = (sd - 0.9994) * 1666.7;
+      r += k*255; g += k*240; b += k*200;
+    }
+  }
+
+  r += star; g += star; b += star;
+
+  /* --- if we're inside the atmosphere, tint the sky blue --- */
+  if (atmBlend > 0.001) {
+    const kk = atmBlend * atmBlend;
+    const localUp = (dx*camX + dy*camY + dz*camZ) / (camR || 1);
+    const hz = 1 - Math.max(0, localUp);
+    const skyR =  70 +  80*hz;
+    const skyG = 130 +  80*hz;
+    const skyB = 210 +  40*hz;
+    r = r*(1-kk) + skyR*kk;
+    g = g*(1-kk) + skyG*kk;
+    b = b*(1-kk) + skyB*kk;
+  }
+
+  if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+  return (0xff000000 | (b|0)<<16 | (g|0)<<8 | (r|0)) >>> 0;
+}
+
+/* --- atmospheric rim: additive glow around the silhouette --- */
+function rimGlow(ox, oy, oz, dx, dy, dz, r, g, b) {
+  const tStar = -(ox*dx + oy*dy + oz*dz);
+  if (tStar <= 0) return (0xff000000 | (b|0)<<16 | (g|0)<<8 | (r|0)) >>> 0;
+
+  const d2 = ox*ox + oy*oy + oz*oz - tStar*tStar;
+  const closest = Math.sqrt(d2 > 0 ? d2 : 0);
+  const h = closest - R;
+
+  if (h <= MAX_ALT + 6 || h >= ATM_H)
+    return (0xff000000 | (b|0)<<16 | (g|0)<<8 | (r|0)) >>> 0;
+
+  const u = (h - MAX_ALT - 6) / (ATM_H - MAX_ALT - 6);
+  let k = 1 - u;
+  k = k*k * 0.95;
+
+  r += k*55; g += k*120; b += k*205;
+  if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+  return (0xff000000 | (b|0)<<16 | (g|0)<<8 | (r|0)) >>> 0;
+}
+
+/* ============================================================
+   7. RENDER
+   ============================================================ */
+function render() {
+  const W = RW, H = RH;
+  const hw = W*0.5, hh = H*0.5;
+  const focal = hw / Math.tan(FOV*0.5);
+
+  /* camera basis */
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cy = Math.cos(yaw),   sy = Math.sin(yaw);
+  const fx = -sy*cp, fy = sp, fz = -cy*cp;
+  const rx =  cy,    ry = 0,  rz = -sy;
+  const ux = ry*fz - rz*fy;
+  const uy = rz*fx - rx*fz;
+  const uz = rx*fy - ry*fx;
+
+  const ox = camX, oy = camY, oz = camZ;
+
+  for (let py = 0; py < H; py++) {
+    const v = -(py + 0.5 - hh) / focal;
+    const row = py * W;
+    for (let px = 0; px < W; px++) {
+      const u = (px + 0.5 - hw) / focal;
+
+      let dx = fx + u*rx + v*ux;
+      let dy = fy + u*ry + v*uy;
+      let dz = fz + u*rz + v*uz;
+      const il = 1/Math.sqrt(dx*dx + dy*dy + dz*dz);
+      dx *= il; dy *= il; dz *= il;
+
+      trace(ox, oy, oz, dx, dy, dz);
+
+      let col;
+      if (hit.ok) {
+        col = shadeHit(dx, dy, dz);
+      } else {
+        col = shadeSky(dx, dy, dz);
+        col = rimGlow(ox, oy, oz, dx, dy, dz,
+                      col & 255, (col >> 8) & 255, (col >> 16) & 255);
+      }
+      buf32[row + px] = col;
+    }
+  }
+}
+
+/* ============================================================
+   8. UPDATE  (6-DOF flight + planetary collision)
+   ============================================================ */
+function update(dt) {
+  const boost  = keys['ShiftLeft'] || keys['ShiftRight'];
+  const maxSpd = boost ? 950 : 75;
+
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cy = Math.cos(yaw),   sy = Math.sin(yaw);
+  const fx = -sy*cp, fy = sp, fz = -cy*cp;
+  const rx =  cy,    ry = 0,  rz = -sy;
+  const ux = ry*fz - rz*fy;
+  const uy = rz*fx - rx*fz;
+  const uz = rx*fy - ry*fx;
+
+  let mx = 0, my = 0, mz = 0;
+  if (keys['KeyW'] || keys['ArrowUp'])    mz += 1;
+  if (keys['KeyS'] || keys['ArrowDown'])  mz -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+  if (keys['KeyA'] || keys['ArrowLeft'])  mx -= 1;
+  if (keys['Space'])                      my += 1;
+  if (keys['ControlLeft'] || keys['ControlRight'] || keys['KeyC']) my -= 1;
+
+  const ml = Math.sqrt(mx*mx + my*my + mz*mz);
+  if (ml > 0) { mx/=ml; my/=ml; mz/=ml; }
+
+  const tvx = (fx*mz + rx*mx + ux*my) * maxSpd;
+  const tvy = (fy*mz + ry*mx + uy*my) * maxSpd;
+  const tvz = (fz*mz + rz*mx + uz*my) * maxSpd;
+
+  const k = Math.min(1, dt * 5);
+  vX += (tvx - vX) * k;
+  vY += (tvy - vY) * k;
+  vZ += (tvz - vZ) * k;
+
+  camX += vX * dt;
+  camY += vY * dt;
+  camZ += vZ * dt;
+
+  /* --- keep the camera above the terrain --- */
+  const r = Math.sqrt(camX*camX + camY*camY + camZ*camZ);
+  const inv = 1/r;
+  const dirX = camX*inv, dirY = camY*inv, dirZ = camZ*inv;
+  const alt = terrainAlt(dirX, dirY, dirZ);
+  const minR = R + (alt > 0 ? alt : 0) + 1.8;
+
+  if (r < minR) {
+    const s = minR / r;
+    camX *= s; camY *= s; camZ *= s;
+    const vr = vX*dirX + vY*dirY + vZ*dirZ;
+    vX -= vr*dirX; vY -= vr*dirY; vZ -= vr*dirZ;
+  }
+
+  updateAtmos();
+}
+
+/* ============================================================
+   9. MAIN LOOP  +  adaptive resolution + HUD
+   ============================================================ */
+let last = performance.now();
+let smoothMs = 12, lastAdj = 0, frames = 0, fpsT = 0, fps = 0;
+const hudEl = document.getElementById('hud');
+
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.1) dt = 0.1;
+
+  update(dt);
+
+  const t0 = performance.now();
+  render();
+  const ms = performance.now() - t0;
+
+  octx.putImageData(img, 0, 0);
+  ctx.drawImage(off, 0, 0, cv.width, cv.height);
+
+  /* --- adaptive quality --- */
+  smoothMs = smoothMs*0.9 + ms*0.1;
+  if (now - lastAdj > 800) {
+    if (smoothMs > 24 && quality > 0.45) {
+      quality -= 0.08; setResolution(quality*320); lastAdj = now;
+    } else if (smoothMs < 11 && quality < 1.35) {
+      quality += 0.08; setResolution(quality*320); lastAdj = now;
+    }
+  }
+
+  /* --- HUD --- */
+  const r = Math.sqrt(camX*camX + camY*camY + camZ*camZ);
+  const inv = 1/r;
+  const alt = terrainAlt(camX*inv, camY*inv, camZ*inv);
+  const aas = r - R - (alt > 0 ? alt : 0);
+  const spd = Math.sqrt(vX*vX + vY*vY + vZ*vZ);
+
+  let mode;
+  if (aas > ATM_H)   mode = 'ORBIT';
+  else if (aas > 25) mode = 'ATMOSPHERE';
+  else               mode = 'SURFACE';
+
+  frames++; fpsT += dt;
+  if (fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
+
+  hudEl.textContent =
+    `PROCEDURAL VOXEL PLANET\n` +
+    `mode   ${mode}\n` +
+    `alt    ${aas.toFixed(1)} m\n` +
+    `speed  ${spd.toFixed(0)} m/s\n` +
+    `fps    ${fps.toFixed(0).padStart(3)}   raster ${ms.toFixed(0)}ms\n` +
+    `res    ${RW}x${RH}  (${(quality*100)|0}%)`;
+
+  requestAnimationFrame(frame);
+}
+
+resizeWindow();
+updateAtmos();
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>

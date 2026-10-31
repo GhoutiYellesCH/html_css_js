@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CPU Voxel Horizon</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#06080f;
+            font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  #c{display:block;width:100vw;height:100vh;image-rendering:pixelated;cursor:crosshair}
+  #hud{position:fixed;left:10px;top:10px;color:#dff;text-shadow:0 1px 3px #000;
+       pointer-events:none;white-space:pre}
+  #hint{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+        color:#fff;background:rgba(0,0,0,.6);padding:16px 26px;border-radius:10px;
+        text-align:center;pointer-events:none;font-size:13px;letter-spacing:.3px}
+  #hint b{font-size:16px;display:block;margin-bottom:6px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="hint"><b>Click to play</b>
+WASD move &middot; mouse look &middot; Shift sprint<br>
+Space / Ctrl = up / down &middot; F = toggle fly</div>
+<script>
+(() => {
+"use strict";
+
+/* ============================================================
+   1. CANVAS + PIXEL BUFFERS
+   ============================================================ */
+const cv   = document.getElementById('c');
+const ctx  = cv.getContext('2d', { alpha:false });
+const off  = document.createElement('canvas');
+const octx = off.getContext('2d', { alpha:false });
+
+let RW = 420, RH = 236;          // internal render resolution
+let img = null, buf32 = null, skyRow = null;
+let quality = 1.0;               // adaptive resolution scale
+
+function setResolution(w){
+  RW = Math.max(160, Math.round(w));
+  RH = Math.max(90,  Math.round(RW * cv.height / cv.width));
+  off.width = RW; off.height = RH;
+  img    = octx.createImageData(RW, RH);
+  buf32  = new Uint32Array(img.data.buffer);
+  skyRow = new Uint32Array(RH);
+  ctx.imageSmoothingEnabled = false;
+}
+
+function resizeWindow(){
+  cv.width  = Math.max(320, window.innerWidth  | 0);
+  cv.height = Math.max(200, window.innerHeight | 0);
+  ctx.imageSmoothingEnabled = false;
+  setResolution(quality * 420);
+}
+window.addEventListener('resize', resizeWindow);
+
+/* ============================================================
+   2. HASH / VALUE NOISE / FBM   (the whole world lives here)
+   ============================================================ */
+const SEED = 0x5eed1a;
+
+function hash2(x, y){
+  let n = Math.imul(x|0, 374761393) ^ Math.imul(y|0, 668265263) ^ SEED;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;        // 0..1
+}
+
+function vnoise(x, y){
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi,        yf = y - yi;
+  const u = xf * xf * (3 - 2*xf);
+  const v = yf * yf * (3 - 2*yf);
+  const a = hash2(xi,   yi  ), b = hash2(xi+1, yi  );
+  const c = hash2(xi,   yi+1), d = hash2(xi+1, yi+1);
+  const ab = a + (b - a) * u;
+  const cd = c + (d - c) * u;
+  return ab + (cd - ab) * v;
+}
+
+function fbm(x, y, oct){
+  let a = 1, f = 1, s = 0, n = 0;
+  for (let i = 0; i < oct; i++){
+    s += a * vnoise(x*f, y*f);
+    n += a;
+    a *= 0.5; f *= 2;
+  }
+  return s / n;
+}
+
+/* ============================================================
+   3. THE WORLD  —  infinite, procedural, quantised to voxels
+   ============================================================ */
+const SEA = 0;
+
+function heightAt(x, z){
+  // continents          (-40 .. +50)
+  let h = (fbm(x*0.0032, z*0.0032, 3) - 0.47) * 130;
+  // rolling hills       (+-9)
+  h += (fbm(x*0.019,  z*0.019,  2) - 0.5)  * 18;
+  // fine detail         (+-2)
+  h += (vnoise(x*0.085, z*0.085)  - 0.5)   * 4;
+  // ---- quantise to 1-unit blocks  =>  the "voxel" silhouette ----
+  return Math.floor(h);
+}
+
+/* ============================================================
+   4. CAMERA + INPUT
+   ============================================================ */
+let camX = 0, camY = 40, camZ = 0;
+let yaw  = 0.6, pitch = -0.10;
+let flying = true;
+const EYE = 1.7;
+
+/* find a nice spawn on land */
+(function spawn(){
+  for (let i = 0; i < 20000; i++){
+    const x = (Math.random() - 0.5) * 8000;
+    const z = (Math.random() - 0.5) * 8000;
+    const h = heightAt(x, z);
+    if (h > 14 && h < 45){ camX = x; camZ = z; camY = h + 25; return; }
+  }
+  camY = 45;
+})();
+
+const keys = Object.create(null);
+let locked = false;
+const hintEl = document.getElementById('hint');
+
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (e.code === 'KeyF') flying = !flying;
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+cv.addEventListener('click', () => {
+  if (cv.requestPointerLock) cv.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  locked = (document.pointerLockElement === cv);
+  hintEl.style.display = locked ? 'none' : 'block';
+});
+document.addEventListener('mousemove', e => {
+  if (!locked) return;
+  yaw   += e.movementX * 0.0024;
+  pitch -= e.movementY * 0.0024;
+  if (pitch >  1.45) pitch =  1.45;
+  if (pitch < -1.45) pitch = -1.45;
+});
+
+function update(dt){
+  const sprint = keys['ShiftLeft'] || keys['ShiftRight'];
+  const spd = (sprint ? 42 : 14) * dt;
+
+  const fhx = Math.sin(yaw), fhz = Math.cos(yaw);   // horizontal forward
+  const rhx = Math.cos(yaw), rhz = -Math.sin(yaw);  // horizontal right
+
+  let mx = 0, mz = 0;
+  if (keys['KeyW'] || keys['ArrowUp'])    mz += 1;
+  if (keys['KeyS'] || keys['ArrowDown'])  mz -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+  if (keys['KeyA'] || keys['ArrowLeft'])  mx -= 1;
+
+  const len = Math.hypot(mx, mz) || 1;
+  camX += (fhx*mz + rhx*mx) / len * spd;
+  camZ += (fhz*mz + rhz*mx) / len * spd;
+
+  const ground = Math.max(heightAt(camX, camZ), SEA);
+
+  if (flying){
+    let vy = 0;
+    if (keys['Space']) vy += 1;
+    if (keys['ControlLeft'] || keys['ControlRight'] || keys['KeyC']) vy -= 1;
+    camY += vy * spd;
+    if (camY < ground + 1.2) camY = ground + 1.2;
+  } else {
+    const target = ground + EYE;
+    camY += (target - camY) * Math.min(1, dt * 14);
+  }
+}
+
+/* ============================================================
+   5. THE RENDERER  —  CPU voxel-space raymarcher
+   ============================================================
+   For every screen column we shoot ONE horizontal ray.
+   We walk it with a geometric (LOD) step, and for every terrain
+   column we hit we project its top onto the screen and fill the
+   vertical span between that projection and everything already
+   drawn in this column.  Near samples are drawn first, so they
+   occlude far ones automatically — a painter's algorithm in a
+   1-pixel-wide y-buffer.
+
+   Because cost is per-COLUMN and steps grow with distance,
+   a 500+ unit view distance is basically free.
+   ============================================================ */
+const FOV  = 1.5;      // horizontal-ish field of view (radians)
+const MAXD = 520;      // view distance in blocks
+
+function render(){
+  const W = RW, H = RH;
+  const hw = W * 0.5, hh = H * 0.5;
+  const focal = hw / Math.tan(FOV * 0.5);
+
+  const sYaw = Math.sin(yaw), cYaw = Math.cos(yaw);
+  const horizonY = hh + focal * Math.tan(pitch);   // true horizon row
+
+  /* ---------- sky gradient ---------- */
+  const invSky = 1 / Math.max(1, H * 0.62);
+  for (let y = 0; y < H; y++){
+    let k = (horizonY - y) * invSky;
+    k = k < 0 ? 0 : (k > 1 ? 1 : k);
+    k = Math.sqrt(k);
+    const r = (176 + ( 36 - 176) * k) | 0;   // horizon -> zenith
+    const g = (208 + ( 86 - 208) * k) | 0;
+    const b = (232 + (162 - 232) * k) | 0;
+    skyRow[y] = 0xff000000 | (b << 16) | (g << 8) | r;
+  }
+  for (let y = 0; y < H; y++) buf32.fill(skyRow[y], y*W, y*W + W);
+
+  /* ---------- terrain ---------- */
+  const FOG_R = 176, FOG_G = 208, FOG_B = 232;   // == horizon colour
+  const FOG_A = 100, FOG_Z = MAXD * 0.98;
+  const invFog = 1 / (FOG_Z - FOG_A);
+
+  for (let i = 0; i < W; i++){
+    /* ray direction for this column (horizontal, unit length) */
+    const sx   = (i + 0.5 - hw) / focal;
+    const invL = 1 / Math.sqrt(1 + sx*sx);
+    const dx = (sYaw + cYaw * sx) * invL;
+    const dz = (cYaw - sYaw * sx) * invL;
+
+    let yMin = H;                  // topmost row already painted
+    let t    = 0.55;
+    let px   = camX + dx * t;
+    let pz   = camZ + dz * t;
+    let prevH = heightAt(px, pz);
+    if (prevH < SEA) prevH = SEA;
+
+    while (t < MAXD){
+      const step = 0.35 + t * 0.045;      // geometric LOD stepping
+      t  += step;
+      px += dx * step;
+      pz += dz * step;
+
+      let h = heightAt(px, pz);
+      let water = false;
+      if (h < SEA){ h = SEA; water = true; }
+
+      /* project the top of this voxel column */
+      const py = (horizonY - focal * (h - camY) / t) | 0;
+
+      if (py < yMin){
+        const y0 = py < 0 ? 0 : py;
+
+        /* ---- material + shading ---- */
+        const nz = hash2(Math.floor(px * 0.6), Math.floor(pz * 0.6));
+        const hb = h + (nz - 0.5) * 3.5;          // noisy biome borders
+
+        let cr, cg, cb;
+        if (water)        { cr =  44; cg =  94; cb = 156; }
+        else if (hb <= 1) { cr = 202; cg = 188; cb = 142; }  // sand
+        else if (hb < 18) { cr =  66; cg = 112; cb =  56; }  // grass
+        else if (hb < 32) { cr = 106; cg = 103; cb =  96; }  // rock
+        else              { cr = 226; cg = 230; cb = 238; }  // snow
+
+        let lit;
+        if (water){
+          lit = 0.95 + nz * 0.10;
+        } else {
+          const slope = (h - prevH) / step;      // + = rising away from us
+          lit = 1 - slope * 0.5;
+          if (lit < 0.58) lit = 0.58;
+          else if (lit > 1.22) lit = 1.22;
+          lit *= 0.92 + nz * 0.16;               // per-block dither
+        }
+
+        let r = cr * lit, g = cg * lit, b = cb * lit;
+
+        /* ---- distance fog -> melts into the sky at the horizon ---- */
+        let f = (t - FOG_A) * invFog;
+        f = f < 0 ? 0 : (f > 1 ? 1 : f);
+        f = f * f * (3 - 2*f);
+
+        r += (FOG_R - r) * f;
+        g += (FOG_G - g) * f;
+        b += (FOG_B - b) * f;
+
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
+
+        const col = 0xff000000 | ((b|0) << 16) | ((g|0) << 8) | (r|0);
+
+        /* ---- fill the vertical span ---- */
+        let idx = y0 * W + i;
+        for (let y = y0; y < yMin; y++, idx += W) buf32[idx] = col;
+
+        yMin = y0;
+        if (yMin === 0) break;     // column fully covered, stop marching
+      }
+      prevH = h;
+    }
+  }
+}
+
+/* ============================================================
+   6. MAIN LOOP  (with adaptive resolution so it never dies)
+   ============================================================ */
+let last = performance.now();
+let smoothMs = 12, lastAdjust = 0, frames = 0, fpsT = 0, fps = 0;
+const hudEl = document.getElementById('hud');
+
+function frame(now){
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.1) dt = 0.1;
+
+  update(dt);
+
+  const t0 = performance.now();
+  render();
+  const ms = performance.now() - t0;
+
+  octx.putImageData(img, 0, 0);
+  ctx.drawImage(off, 0, 0, cv.width, cv.height);
+
+  /* --- adaptive quality --- */
+  smoothMs = smoothMs * 0.9 + ms * 0.1;
+  if (now - lastAdjust > 900){
+    if (smoothMs > 21 && quality > 0.45){
+      quality -= 0.1; setResolution(quality * 420); lastAdjust = now;
+    } else if (smoothMs < 9 && quality < 1.0){
+      quality += 0.1; setResolution(quality * 420); lastAdjust = now;
+    }
+  }
+
+  /* --- hud --- */
+  frames++; fpsT += dt;
+  if (fpsT > 0.5){ fps = frames / fpsT; frames = 0; fpsT = 0; }
+  hudEl.textContent =
+    `CPU voxel horizon\n` +
+    `fps ${fps.toFixed(0).padStart(3)}   raster ${ms.toFixed(1)}ms\n` +
+    `res ${RW}x${RH}  (${(quality*100)|0}%)\n` +
+    `xyz ${camX.toFixed(0)} ${camY.toFixed(0)} ${camZ.toFixed(0)}\n` +
+    `${flying ? 'FLYING' : 'WALKING'}`;
+
+  requestAnimationFrame(frame);
+}
+
+resizeWindow();
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
